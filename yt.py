@@ -1,170 +1,210 @@
 import os
+import yt_dlp
+import asyncio
+import shutil
 import re
-import subprocess
-from pytube import YouTube, Playlist
-from collections import defaultdict
+import signal
 
-
-class YouTubeDownloader:
-    def __init__(self, url):
+class DownloadInfo:
+    def __init__(self, title, url):
+        self.title = title
         self.url = url
-        # Set up the base path to include a "youtube videos" subfolder
-        self.base_path = os.path.join(os.getcwd(), "youtube videos")
-        # Ensure the "youtube videos" folder exists
-        os.makedirs(self.base_path, exist_ok=True)
+        self.status = "pending"
+        self.final_file = None
 
-    def on_progress(self, stream, chunk, bytes_remaining):
-        total_size = stream.filesize
-        bytes_downloaded = total_size - bytes_remaining
-        percentage_of_completion = bytes_downloaded / total_size * 100
-        print(f"Downloading: {percentage_of_completion:.2f}%", end="\r")
+class SimpleDownloader:
+    def __init__(self, download_dir, final_dir):
+        self.download_dir = download_dir
+        self.final_dir = final_dir
 
-    def list_qualities(self, yt):
-        all_streams = list(yt.streams.filter(progressive=True)) + list(
-            yt.streams.filter(adaptive=True)
-        )
-
-        # Store qualities, initially preferring MP4
-        qualities = {}
-        for stream in all_streams:
-            if stream.resolution:
-                # Prioritize adding or updating the entry if the format is MP4
-                if stream.mime_type == "video/mp4":
-                    qualities[stream.resolution] = {
-                        "resolution": stream.resolution,
-                        "format": "mp4",
-                    }
-                elif stream.mime_type == "video/webm":
-                    # Add WEBM only if there's no MP4 version or if the WEBM resolution is higher than any MP4
-                    if (stream.resolution not in qualities) or (
-                        int(stream.resolution[:-1])
-                        > int(qualities[stream.resolution]["resolution"][:-1])
-                    ):
-                        qualities[stream.resolution] = {
-                            "resolution": stream.resolution,
-                            "format": "webm",
-                        }
-
-        # Convert the qualities dict to a sorted list of strings, ensuring highest resolutions are listed first
-        sorted_qualities_list = sorted(
-            [f"{key} ({value['format']})" for key, value in qualities.items()],
-            key=lambda x: int(x.split(" ")[0][:-1]),
-            reverse=True,
-        )
-        return sorted_qualities_list
-
-    def sanitize_filename(self, name):
-        return re.sub(r'[\\/*?:"<>|]', "_", name)
-
-    def is_gpu_available(self):
+    def get_video_info(self, info):
         try:
-            result = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"],
-                capture_output=True,
-                text=True,
-            )
-            return "h264_nvenc" in result.stdout or "h264_vaapi" in result.stdout
-        except Exception as e:
-            print(f"Error checking GPU availability: {e}")
-            return False
+            ydl_opts = {
+                'quiet': True,  # Suppress output
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                video_info = ydl.extract_info(info.url, download=False)
+            return video_info
+        except yt_dlp.utils.YoutubeDLError as e:
+            print(f"Error: {e}")
+            return None
 
-    def download_video(self, video_url, path, selected_quality):
-        yt = YouTube(video_url)
+    def list_formats(self, video_info):
+        return video_info.get('formats', [])
 
-        # Immediately download the highest resolution if 'auto' is selected
-        if selected_quality == "auto":
-            video_stream = yt.streams.get_highest_resolution()
-        else:
-            resolution, format_ = (
-                selected_quality.split(" ")[0],
-                selected_quality.split(" ")[1][1:-1],
-            )
-            video_stream = yt.streams.filter(
-                res=resolution, mime_type=f"video/{format_}"
-            ).first()
+    def download_video(self, info, format_id, height):
+        try:
+            ydl_opts = self._generate_ydl_options(format_id, height)
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(info.url, download=True)
+                video_title = info_dict.get('title', 'Video')
+                video_path = ydl.prepare_filename(info_dict)
+                final_filename = self._generate_final_filename(video_title, height)
+                final_path = os.path.join(self.download_dir, final_filename)
 
-        if not video_stream:
-            print(f"No video stream found for {selected_quality}")
-            return
+                if not os.path.exists(final_path):
+                    final_path = video_path
 
-        # Proceed to download the video
-        final_filename = (
-            f"{self.sanitize_filename(yt.title)}.{video_stream.mime_type.split('/')[1]}"
+            sanitized_final_path = re.sub(r'[<>:"/\\|?*\$]', '_', final_filename)
+            sanitized_final_path = os.path.join(self.final_dir, sanitized_final_path)
+
+            os.makedirs(self.final_dir, exist_ok=True)
+            shutil.move(final_path, sanitized_final_path)
+            info.status = "finished"
+            info.final_file = sanitized_final_path
+            print(f"Moved to final directory: {sanitized_final_path}")
+        except yt_dlp.utils.YoutubeDLError as e:
+            print(f"Error: {e}")
+            info.status = "error"
+        except FileNotFoundError:
+            print("File not found after conversion, possibly already moved or deleted.")
+            info.status = "error"
+
+    def _generate_ydl_options(self, format_id, height):
+        common_opts = {
+            'format': f"{format_id}+bestaudio[protocol^=m3u8]",
+            'outtmpl': os.path.join(self.download_dir, '%(title)s.%(ext)s'),
+            'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+            'no_warnings': True,
+            'force_generic_extractor': True,
+            'rm_cachedir': True,
+            'concurrent_fragments': 4,
+            'retries': 20,
+            'fragment_retries': 20,
+            'retry_sleep': 'exp=1:120:2',
+            'xattr_set_filesize': True,
+            'hls_use_mpegts': True,
+            'keep_fragments': False,
+            'http_chunk_size': 10485760,
+            'prefer_free_formats': True,
+            'noplaylist': True,
+            'socket_timeout': 30,
+            'buffer_size': 32 * 1024,
+        }
+
+        if height == 'audio':
+            common_opts['format'] = f"{format_id}"
+            common_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+            common_opts['outtmpl'] = os.path.join(self.download_dir, '%(title)s_audio.%(ext)s')
+
+        return common_opts
+
+    def _generate_final_filename(self, title, height):
+        if height == 'audio':
+            return f"{title}_audio.mp3"
+        return f"{title}_{height}p.mp4"
+
+    def filter_formats(self, formats):
+        seen_resolutions = set()
+        filtered_formats = []
+
+        for f in formats:
+            resolution = f.get('resolution')
+            ext = f.get('ext')
+            if resolution and resolution != 'audio only' and ext != 'mhtml' and resolution not in seen_resolutions:
+                filtered_formats.append(f)
+                seen_resolutions.add(resolution)
+
+        return sorted(filtered_formats, key=lambda x: int(x['height']) if x['height'] else 0, reverse=True)
+
+    def best_audio_format(self, formats):
+        return max(
+            (f for f in formats if f.get('vcodec') == 'none' and f.get('abr') is not None),
+            key=lambda x: x.get('abr', 0),
+            default=None
         )
-        print(f"{yt.title} is now downloading...")
-        video_stream.download(output_path=path, filename=final_filename)
-        print(f"Download completed: {final_filename}")
 
-    def handle_playlist(self, playlist_url, resolution="auto"):
-        # Adjustments for handling playlist downloads
-        playlist = Playlist(playlist_url)
-        playlist_title = self.sanitize_filename(playlist.title)
-        # Create a subfolder within "youtube videos" specifically for this playlist
-        playlist_path = os.path.join(self.base_path, playlist_title)
-        os.makedirs(playlist_path, exist_ok=True)
-        for video_url in playlist.video_urls:
-            self.download_video(video_url, playlist_path, resolution)
-
-    def prompt_for_quality(self, yt):
-        print("Loading available qualities...")
-        qualities = self.list_qualities(yt)
-        print("Available qualities:")
-        for i, quality in enumerate(qualities, start=1):
-            print(f"{i}. {quality}")
-        print(f"{len(qualities)+1}. Auto (best available)")
-
-        while True:
-            choice = input("Select the desired quality: ").strip()
+    def cleanup_temp_dir(self):
+        for filename in os.listdir(self.download_dir):
+            file_path = os.path.join(self.download_dir, filename)
             try:
-                choice_num = int(choice)
-                if 1 <= choice_num <= len(qualities) + 1:
-                    if choice_num == len(qualities) + 1:
-                        selected_quality = "auto"
-                        highest_quality = qualities[0].split(" ")[
-                            0
-                        ]  # Assuming highest quality is first
-                        print(f"Auto selected: {highest_quality}")
-                    else:
-                        selected_quality = qualities[choice_num - 1]
-                        print(f"Selected quality: {selected_quality}")
-                    return selected_quality
-                else:
-                    print("Invalid selection. Please choose a valid option.")
-            except ValueError:
-                print("Please enter a number corresponding to your choice.")
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(f"Failed to delete {file_path}. Reason: {e}")
 
-    def is_valid_youtube_url(self, url):
-        # Regular expression for validating a YouTube URL
-        youtube_regex = (
-            r"(https?://)?(www\.)?"
-            "(youtube|youtu|youtube-nocookie)\.(com|be)/"
-            "(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})"
-        )
-        return re.match(youtube_regex, url) is not None
+async def main():
+    downloader = SimpleDownloader(download_dir, final_dir)
 
-    def run(self):
-        print("Processing your request...")
-        if not self.is_valid_youtube_url(self.url):
-            print(
-                "The provided input is not a valid YouTube URL. Please try again with a valid link."
-            )
-            return
+    while True:
+        url = input("Enter the video or playlist URL: ")
+        info = DownloadInfo("Video", url)
+        video_info = await asyncio.get_running_loop().run_in_executor(None, downloader.get_video_info, info)
 
-        yt = YouTube(self.url)
-        selected_quality = self.prompt_for_quality(yt)
-
-        if "playlist?list=" in self.url:
-            print(f"playlist download started...")
-            self.handle_playlist(self.url, selected_quality)
+        if video_info:
+            break
         else:
-            video_title = self.sanitize_filename(yt.title)
-            video_path = os.path.join(self.base_path, video_title)
-            os.makedirs(video_path, exist_ok=True)
-            self.download_video(self.url, video_path, selected_quality)
+            print("Invalid URL or failed to retrieve video information. Please enter a valid URL.")
+    
+    video_title = video_info.get('title', 'Unknown Title')
+    print(f"Video Title: {video_title}")
 
+    formats = downloader.list_formats(video_info)
+    filtered_formats = downloader.filter_formats(formats)
+    best_audio_format = downloader.best_audio_format(formats)
 
-# The example usage remains unchanged
+    if not filtered_formats and not best_audio_format:
+        print("No valid formats found for the provided video. Please check the URL and try again.")
+        return
+
+    print("Available formats:")
+    numbered_formats = []
+    for i, f in enumerate(filtered_formats, start=1):
+        resolution = f.get('resolution', 'unknown')
+        print(f"{i}: {f['ext']} - {resolution}")
+        numbered_formats.append((f['format_id'], f.get('height', 'audio')))
+
+    if best_audio_format:
+        i += 1
+        print(f"{i}: {best_audio_format['ext']} - audio")
+        numbered_formats.append((best_audio_format['format_id'], 'audio'))
+
+    while True:
+        try:
+            format_number = int(input("Enter the number of the format you want to download: "))
+            if format_number < 1 or format_number > len(numbered_formats):
+                print(f"Invalid format selection. Please enter a number between 1 and {len(numbered_formats)}.")
+            else:
+                break
+        except ValueError:
+            print(f"Invalid input. Please enter a number between 1 and {len(numbered_formats)}.")
+
+    selected_format_id, height = numbered_formats[format_number - 1]
+
+    await asyncio.get_running_loop().run_in_executor(None, downloader.download_video, info, selected_format_id, height)
+
+    if info.status == "finished":
+        print(f"Download and move completed: {info.final_file}")
+    else:
+        print("Download failed.")
+
+    downloader.cleanup_temp_dir()
+    print("Temporary files cleared.")
+
+def handle_exit(downloader):
+    downloader.cleanup_temp_dir()
+    print("Temporary files cleared.")
+
 if __name__ == "__main__":
-    url_input = input("Enter the YouTube video or playlist URL: ")
-    downloader = YouTubeDownloader(url_input)
-    downloader.run()
+    download_dir = './temp'
+    final_dir = './YouTube Videos'
+    downloader = SimpleDownloader(download_dir, final_dir)
+
+    signal.signal(signal.SIGINT, lambda s, f: handle_exit(downloader))
+    signal.signal(signal.SIGTERM, lambda s, f: handle_exit(downloader))
+
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        handle_exit(downloader)

@@ -1,12 +1,64 @@
-# Ignore video files
-*.mp4
-*.avi
-*.mov
-*.wmv
-*.flv
-*.mkv
-*.webm
-*.mpeg
-*.mpg
-*.m4v
-start.bat
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# pytest
+.cache
+
+# mypy
+.mypy_cache/
+
+# coverage
+.coverage
+coverage.xml
+*.cover
+*.py,cover
+nosetests.xml
+test_*.xml
+
+# dotenv
+.env
+.env.*
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pycharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Output folder
+youtube videos/
+
+# temp folder
+temp/
+
+# MacOS
+.DS_Store
+
+# Windows
+Thumbs.db
